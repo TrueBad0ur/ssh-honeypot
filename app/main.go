@@ -179,9 +179,7 @@ func fakeTerminal(s ssh.Session) {
 		commandLineSlice := strings.Split(commandLine, " ")
 		if commandLineSlice[0] == "exit" {
 			break
-		}
-
-		if commandLineSlice[0] == "ls" {
+		} else if commandLineSlice[0] == "ls" {
 			if doCommandLogging {
 				cmdChan <- command{
 					username:  s.User(),
@@ -190,9 +188,7 @@ func fakeTerminal(s ssh.Session) {
 					timestamp: fmt.Sprint(time.Now().Unix())}
 			}
 			term.Write([]byte(fmt.Sprintf("id_rsa  id_rsa.pub  configs\n")))
-		}
-
-		if commandLineSlice[0] != "" {
+		} else if commandLineSlice[0] != "" {
 			if doCommandLogging {
 				cmdChan <- command{
 					username:  s.User(),
