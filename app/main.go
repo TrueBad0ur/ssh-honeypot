@@ -167,7 +167,7 @@ func fakeTerminal(s ssh.Session) {
 	}
 	term := terminal.NewTerminal(s, fmt.Sprintf("%s@%s:~$ ", s.User(), hostname))
 	go func(s ssh.Session) { //timeout sessions to save CPU.
-		time.Sleep(time.Second * 30)
+		time.Sleep(time.Second * 60)
 		s.Close()
 	}(s)
 	for {
@@ -180,6 +180,18 @@ func fakeTerminal(s ssh.Session) {
 		if commandLineSlice[0] == "exit" {
 			break
 		}
+
+		if commandLineSlice[0] == "ls" {
+			if doCommandLogging {
+				cmdChan <- command{
+					username:  s.User(),
+					remoteIP:  s.RemoteAddr().String(),
+					command:   commandLine,
+					timestamp: fmt.Sprint(time.Now().Unix())}
+			}
+			term.Write([]byte(fmt.Sprintf("id_rsa  id_rsa.pub  configs\n")))
+		}
+
 		if commandLineSlice[0] != "" {
 			if doCommandLogging {
 				cmdChan <- command{
