@@ -1,0 +1,10 @@
+version: "3.9"
+services:
+  ssh-honeypot:
+    image: truebad0ur/ssh-honeypot:v0.0.5
+    container_name: ssh-honeypot
+    build: ./app
+    ports:
+      - 22:22
+    volumes:
+      - ./app/db/:/project/db/

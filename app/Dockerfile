@@ -3,7 +3,7 @@ RUN apk update && apk add --no-cache openssh-keygen build-base
 WORKDIR /build
 RUN ssh-keygen -f ./id_rsa -N ""
 
-COPY app/main.go .
+COPY main.go .
 
 RUN go mod init ssh-honeypot
 RUN go get -u "github.com/gliderlabs/ssh"

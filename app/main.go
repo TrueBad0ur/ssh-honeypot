@@ -49,7 +49,7 @@ func main() {
 		keyPath     string = "id_rsa"
 		fingerprint string = "OpenSSH_8.2p1 Debian-4"
 	)
-	databasePointer, err := sql.Open("sqlite3", "honeypot.db")
+	databasePointer, err := sql.Open("sqlite3", "db/honeypot.db")
 	if err != nil {
 		log.Println(err.Error())
 		log.Fatal("Database connection failed")
