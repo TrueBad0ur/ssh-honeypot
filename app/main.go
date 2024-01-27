@@ -21,7 +21,7 @@ var (
 	doCommandLogging bool   = false
 	hostname         string = "kali"
 	message          string = "Don't blindly SSH into every VM you see."
-	lootChan         chan (loginData)
+	loginChan        chan (loginData)
 	cmdChan          chan (command)
 )
 
@@ -55,7 +55,7 @@ func main() {
 		log.Fatal("Database connection failed")
 	}
 	database = databasePointer
-	lootChan = make(chan (loginData), buffSize)
+	loginChan = make(chan (loginData), buffSize)
 	cmdChan = make(chan (command), buffSize)
 	flaggy.UInt(&lport, "p", "port", "Local port to listen for SSH on")
 	flaggy.IP(&lhost, "i", "interface", "IP address for the interface to listen on")
@@ -105,11 +105,18 @@ func main() {
 	log.Fatal(server.ListenAndServe())
 }
 
+//func printWithDelay(multiLineString string) {
+//	for _, line := range strings.Split(strings.TrimSuffix(multiLineString, "\n"), "\n") {
+//		time.Sleep(10000 * time.Nanosecond)
+//		fmt.Println(line)
+//	}
+//}
+
 // These functions ensure only one thread is writing to the DB at once.
 // Each handler runs in parallel so we cannot write from that thread safely.
 func threadsafeLootLogger() {
 	for {
-		logLoot(<-lootChan)
+		logLogin(<-loginChan)
 	}
 }
 
@@ -135,7 +142,7 @@ func logCommand(cmd command) {
 	}
 }
 
-func logLoot(data loginData) { //TODO quoted string username
+func logLogin(data loginData) { //TODO quoted string username
 	statement, err := database.Prepare(
 		"INSERT INTO Login(Username, Password, RemoteIP, RemoteVersion, Timestamp) values(?,?,?,?,?)")
 	if err != nil {
@@ -166,37 +173,41 @@ func fakeTerminal(s ssh.Session) {
 			timestamp: fmt.Sprint(time.Now().Unix())}
 	}
 	term := terminal.NewTerminal(s, fmt.Sprintf("%s@%s:~$ ", s.User(), hostname))
-	go func(s ssh.Session) { //timeout sessions to save CPU.
-		time.Sleep(time.Second * 60)
-		s.Close()
-	}(s)
+	//go func(s ssh.Session) { //timeout sessions to save CPU.
+	//	time.Sleep(time.Second * 60)
+	//	s.Close()
+	//}(s)
 	for {
 		commandLine, err := term.ReadLine()
 		if err != nil {
 			s.Close()
 			break
 		}
+
 		commandLineSlice := strings.Split(commandLine, " ")
+
 		if commandLineSlice[0] == "exit" {
+			if doCommandLogging {
+				cmdChan <- command{
+					username:  s.User(),
+					remoteIP:  s.RemoteAddr().String(),
+					command:   commandLine,
+					timestamp: fmt.Sprint(time.Now().Unix())}
+			}
 			break
 		} else if commandLineSlice[0] == "ls" {
-			if doCommandLogging {
-				cmdChan <- command{
-					username:  s.User(),
-					remoteIP:  s.RemoteAddr().String(),
-					command:   commandLine,
-					timestamp: fmt.Sprint(time.Now().Unix())}
-			}
 			term.Write([]byte(fmt.Sprintf("id_rsa  id_rsa.pub  configs\n")))
+		} else if strings.Contains(commandLine, "update") {
+			term.Write([]byte(fmt.Sprintf("Get:1 file:/etc/apt/mirrors/debian.list Mirrorlist [40 B]\nGet:5 file:/etc/apt/mirrors/debian-security.list Mirrorlist [25 B]\nReading package lists... Done\nBuilding dependency tree... Done\nReading state information... Done\nAll packages are up to date.\n")))
 		} else if commandLineSlice[0] != "" {
-			if doCommandLogging {
-				cmdChan <- command{
-					username:  s.User(),
-					remoteIP:  s.RemoteAddr().String(),
-					command:   commandLine,
-					timestamp: fmt.Sprint(time.Now().Unix())}
-			}
 			term.Write([]byte(fmt.Sprintf("bash: %s: command not found\n", commandLineSlice[0])))
+		}
+		if doCommandLogging {
+			cmdChan <- command{
+				username:  s.User(),
+				remoteIP:  s.RemoteAddr().String(),
+				command:   commandLine,
+				timestamp: fmt.Sprint(time.Now().Unix())}
 		}
 	}
 	s.Close()
@@ -209,7 +220,7 @@ func passwordHandler(context ssh.Context, password string) bool {
 		remoteIP:      context.RemoteAddr().String(),
 		remoteVersion: context.ClientVersion(),
 		timestamp:     fmt.Sprint(time.Now().Unix())}
-	//logLoot(data)
-	lootChan <- data
+	//logLogin(data)
+	loginChan <- data
 	return true
 }
