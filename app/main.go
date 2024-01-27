@@ -44,7 +44,7 @@ type command struct {
 
 func main() {
 	var (
-		lport       uint   = 2222
+		lport       uint   = 22
 		lhost       net.IP = net.ParseIP("0.0.0.0")
 		keyPath     string = "id_rsa"
 		fingerprint string = "OpenSSH_8.2p1 Debian-4"
