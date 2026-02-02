@@ -3,9 +3,10 @@ package main
 import (
 	"database/sql"
 	"fmt"
-	"io/ioutil"
 	"log"
 	"net"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -13,7 +14,7 @@ import (
 	"github.com/integrii/flaggy"
 	_ "github.com/mattn/go-sqlite3"
 	gossh "golang.org/x/crypto/ssh"
-	"golang.org/x/crypto/ssh/terminal"
+	"golang.org/x/term"
 )
 
 var (
@@ -49,7 +50,7 @@ func main() {
 		keyPath     string = "id_rsa"
 		fingerprint string = "OpenSSH_8.2p1 Debian-4"
 	)
-	databasePointer, err := sql.Open("sqlite3", "db/honeypot.db")
+	databasePointer, err := initDatabase("db/honeypot.db")
 	if err != nil {
 		log.Println(err.Error())
 		log.Fatal("Database connection failed")
@@ -75,7 +76,7 @@ func main() {
 		flaggy.ShowHelpAndExit("No subcommand supplied")
 	}
 	log.SetPrefix("SSH - ")
-	privKeyBytes, err := ioutil.ReadFile(keyPath)
+	privKeyBytes, err := os.ReadFile(keyPath)
 	if err != nil {
 		log.Panicln("Error reading privkey:\t", err.Error())
 	}
@@ -111,6 +112,38 @@ func main() {
 //		fmt.Println(line)
 //	}
 //}
+
+func initDatabase(path string) (*sql.DB, error) {
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		return nil, fmt.Errorf("create db dir: %w", err)
+	}
+	db, err := sql.Open("sqlite3", path)
+	if err != nil {
+		return nil, err
+	}
+	schema := `
+	CREATE TABLE IF NOT EXISTS Login (
+		LoginID INTEGER PRIMARY KEY AUTOINCREMENT,
+		Username      TEXT,
+		Password      TEXT,
+		RemoteIP      TEXT,
+		RemoteVersion TEXT,
+		Timestamp     TEXT
+	);
+	CREATE TABLE IF NOT EXISTS Command (
+		CommandID INTEGER PRIMARY KEY AUTOINCREMENT,
+		Username  TEXT,
+		RemoteIP  TEXT,
+		Command   TEXT,
+		Timestamp TEXT
+	);
+	`
+	if _, err := db.Exec(schema); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("init schema: %w", err)
+	}
+	return db, nil
+}
 
 // These functions ensure only one thread is writing to the DB at once.
 // Each handler runs in parallel so we cannot write from that thread safely.
@@ -172,11 +205,7 @@ func fakeTerminal(s ssh.Session) {
 			command:   commandLine,
 			timestamp: fmt.Sprint(time.Now().Unix())}
 	}
-	term := terminal.NewTerminal(s, fmt.Sprintf("%s@%s:~$ ", s.User(), hostname))
-	//go func(s ssh.Session) { //timeout sessions to save CPU.
-	//	time.Sleep(time.Second * 60)
-	//	s.Close()
-	//}(s)
+	term := term.NewTerminal(s, fmt.Sprintf("%s@%s:~$ ", s.User(), hostname))
 	for {
 		commandLine, err := term.ReadLine()
 		if err != nil {
@@ -184,9 +213,13 @@ func fakeTerminal(s ssh.Session) {
 			break
 		}
 
-		commandLineSlice := strings.Split(commandLine, " ")
+		firstWord := strings.Fields(commandLine)
+		if len(firstWord) == 0 {
+			continue
+		}
+		cmd := firstWord[0]
 
-		if commandLineSlice[0] == "exit" {
+		if cmd == "exit" {
 			if doCommandLogging {
 				cmdChan <- command{
 					username:  s.User(),
@@ -195,22 +228,118 @@ func fakeTerminal(s ssh.Session) {
 					timestamp: fmt.Sprint(time.Now().Unix())}
 			}
 			break
-		} else if commandLineSlice[0] == "ls" {
-			term.Write([]byte(fmt.Sprintf("id_rsa  id_rsa.pub  configs\n")))
-		} else if strings.Contains(commandLine, "update") {
-			term.Write([]byte(fmt.Sprintf("Get:1 file:/etc/apt/mirrors/debian.list Mirrorlist [40 B]\nGet:5 file:/etc/apt/mirrors/debian-security.list Mirrorlist [25 B]\nReading package lists... Done\nBuilding dependency tree... Done\nReading state information... Done\nAll packages are up to date.\n")))
-		} else if commandLineSlice[0] != "" {
-			term.Write([]byte(fmt.Sprintf("bash: %s: command not found\n", commandLineSlice[0])))
 		}
+
+		output := emulateCommand(commandLine, s.User())
+		if output != "" {
+			term.Write([]byte(output))
+		}
+
 		if doCommandLogging {
 			cmdChan <- command{
 				username:  s.User(),
 				remoteIP:  s.RemoteAddr().String(),
 				command:   commandLine,
 				timestamp: fmt.Sprint(time.Now().Unix())}
-		}
+			}
 	}
 	s.Close()
+}
+
+// emulateCommand returns fake OS output for bot commands. For chained commands (;), emulates each segment.
+func emulateCommand(line, username string) string {
+	var out strings.Builder
+	segments := strings.Split(line, ";")
+	for _, seg := range segments {
+		seg = strings.TrimSpace(seg)
+		if seg == "" {
+			continue
+		}
+		parts := strings.Fields(seg)
+		if len(parts) == 0 {
+			continue
+		}
+		cmd := parts[0]
+		rest := strings.TrimSpace(strings.TrimPrefix(seg, parts[0]))
+
+		switch cmd {
+		case "exit":
+			continue
+		case "ls":
+			out.WriteString("id_rsa  id_rsa.pub  configs\n")
+		case "whoami":
+			out.WriteString(username + "\n")
+		case "id":
+			out.WriteString(fmt.Sprintf("uid=1000(%s) gid=1000(%s) groups=1000(%s),27(sudo),999(docker)\n", username, username, username))
+		case "pwd":
+			out.WriteString(fmt.Sprintf("/home/%s\n", username))
+		case "cd":
+			// cd produces no output on success
+			continue
+		case "chmod":
+			continue
+		case "rm":
+			continue
+		case "history":
+			continue
+		case "nproc":
+			out.WriteString("4\n")
+		case "uname":
+			if strings.Contains(rest, "-a") || strings.Contains(line, "uname -a") {
+				out.WriteString(fmt.Sprintf("Linux %s 5.10.0-21-amd64 #1 SMP Debian 5.10.162-1 (2023-01-21) x86_64 GNU/Linux\n", hostname))
+			} else if strings.Contains(rest, "-m") {
+				out.WriteString("x86_64\n")
+			} else if strings.Contains(rest, "-n") || strings.Contains(rest, "-r") || strings.Contains(rest, "-s") || strings.Contains(rest, "-v") {
+				out.WriteString(fmt.Sprintf("Linux %s 5.10.0-21-amd64 #1 SMP Debian 5.10.162-1 (2023-01-21) x86_64\n", hostname))
+			} else {
+				out.WriteString(fmt.Sprintf("Linux %s 5.10.0-21-amd64 #1 SMP Debian 5.10.162-1 (2023-01-21) x86_64\n", hostname))
+			}
+		case "uptime":
+			out.WriteString(" 12:34:56 up 2 days,  3:21,  1 user,  load average: 0.12, 0.08, 0.06\n")
+		case "lscpu":
+			out.WriteString("Model name:            Intel(R) Core(TM) i5-8400 CPU @ 2.80GHz\n")
+		case "lspci":
+			if strings.Contains(line, "VGA") || strings.Contains(line, "3D") || strings.Contains(line, "Radeon") {
+				out.WriteString("00:02.0 VGA compatible controller: Intel Corporation HD Graphics 630\n")
+			} else {
+				out.WriteString("00:00.0 Host bridge: Intel Corporation 8th Gen Core Processor Host Bridge\n00:02.0 VGA compatible controller: Intel Corporation HD Graphics 630\n")
+			}
+		case "nvidia-smi":
+			out.WriteString("NVIDIA-SMI has failed because it couldn't communicate with the NVIDIA driver.\n")
+		case "curl":
+			if strings.Contains(line, "ipinfo.io/org") {
+				out.WriteString("AS15169 Google LLC\n")
+			} else if strings.Contains(line, "http") || strings.Contains(line, "://") {
+				out.WriteString("  % Total    % Received % Xferd  Average Speed   Time    Time     Time  Current\n                                 Dload  Upload   Total   Spent    Left  Speed\n100   123  100   123    0     0   1234      0 --:--:-- --:--:-- --:--:--   123\n")
+			} else {
+				out.WriteString(fmt.Sprintf("bash: %s: command not found\n", cmd))
+			}
+		case "wget":
+			if strings.Contains(line, "http") || strings.Contains(line, "://") || strings.Contains(rest, "-O") {
+				out.WriteString("--2024-01-15 12:34:56--  http://example.com/script.sh\nResolving example.com... 93.184.216.34\nConnecting to example.com|93.184.216.34|:80... connected.\nHTTP request sent, awaiting response... 200 OK\nLength: 1234 (1.2K) [application/x-sh]\nSaving to: 'script.sh'\nscript.sh           100%[===================>]   1.21K  --.-KB/s    in 0s\n2024-01-15 12:34:56 (12.3 MB/s) - 'script.sh' saved [1234/1234]\n")
+			} else {
+				out.WriteString(fmt.Sprintf("bash: %s: command not found\n", cmd))
+			}
+		case "ip":
+			if strings.Contains(line, " r ") || strings.Contains(line, " route") {
+				out.WriteString("10.0.0.0/24 dev eth0 proto kernel scope link src 10.0.0.5\n")
+			} else {
+				out.WriteString("1: lo: <LOOPBACK,UP> mtu 65536\n2: eth0: <BROADCAST,UP> mtu 1500\n")
+			}
+		default:
+			if strings.Contains(line, "update") {
+				out.WriteString("Get:1 file:/etc/apt/mirrors/debian.list Mirrorlist [40 B]\nGet:5 file:/etc/apt/mirrors/debian-security.list Mirrorlist [25 B]\nReading package lists... Done\nBuilding dependency tree... Done\nReading state information... Done\nAll packages are up to date.\n")
+			} else if strings.HasPrefix(cmd, "./") || (cmd == "sh" && len(parts) > 1) {
+				// ./script.sh or sh script.sh - fake execution (mining/backdoor scripts often produce no output)
+				continue
+			} else if cmd == "scp" {
+				continue
+			} else if cmd != "" {
+				out.WriteString(fmt.Sprintf("bash: %s: command not found\n", cmd))
+			}
+		}
+	}
+	return out.String()
 }
 
 func passwordHandler(context ssh.Context, password string) bool {

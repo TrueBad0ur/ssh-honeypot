@@ -1,0 +1,354 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>SSH Honeypot — Database Viewer</title>
+  <script src="https://sql.js.org/dist/sql-wasm.js"></script>
+  <style>
+    :root {
+      --bg: #0d1117;
+      --surface: #161b22;
+      --border: #30363d;
+      --text: #c9d1d9;
+      --muted: #8b949e;
+      --accent: #58a6ff;
+      --success: #3fb950;
+      --danger: #f85149;
+    }
+    * { box-sizing: border-box; }
+    body {
+      font-family: 'JetBrains Mono', 'Fira Code', 'Consolas', monospace;
+      background: var(--bg);
+      color: var(--text);
+      margin: 0;
+      padding: 1.5rem;
+      min-height: 100vh;
+    }
+    h1 {
+      font-size: 1.25rem;
+      font-weight: 600;
+      margin: 0 0 1rem;
+      color: var(--accent);
+    }
+    .upload-zone {
+      border: 2px dashed var(--border);
+      border-radius: 8px;
+      padding: 2rem;
+      text-align: center;
+      margin-bottom: 1.5rem;
+      cursor: pointer;
+      transition: border-color 0.2s, background 0.2s;
+    }
+    .upload-zone:hover, .upload-zone.dragover { border-color: var(--accent); background: rgba(88,166,255,0.05); }
+    .upload-zone input { display: none; }
+    .upload-zone p { margin: 0; color: var(--muted); }
+    .tabs {
+      display: flex;
+      gap: 0.5rem;
+      margin-bottom: 1rem;
+    }
+    .tabs button {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      color: var(--text);
+      padding: 0.5rem 1rem;
+      border-radius: 6px;
+      cursor: pointer;
+      font-family: inherit;
+    }
+    .tabs button:hover { border-color: var(--accent); }
+    .tabs button.active { background: var(--accent); color: var(--bg); border-color: var(--accent); }
+    .filters {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.75rem;
+      margin-bottom: 1rem;
+      align-items: center;
+    }
+    .filters label { color: var(--muted); font-size: 0.85rem; }
+    .filters input, .filters select {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      color: var(--text);
+      padding: 0.4rem 0.6rem;
+      border-radius: 4px;
+      font-family: inherit;
+    }
+    .filters input:focus, .filters select:focus {
+      outline: none;
+      border-color: var(--accent);
+    }
+    .stats {
+      display: flex;
+      gap: 1.5rem;
+      margin-bottom: 1rem;
+      font-size: 0.9rem;
+      color: var(--muted);
+    }
+    .stats span strong { color: var(--success); }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 0.85rem;
+    }
+    th, td {
+      padding: 0.5rem 0.75rem;
+      text-align: left;
+      border-bottom: 1px solid var(--border);
+    }
+    th {
+      background: var(--surface);
+      color: var(--muted);
+      font-weight: 500;
+      position: sticky;
+      top: 0;
+    }
+    tr:hover td { background: rgba(88,166,255,0.05); }
+    .table-wrap {
+      overflow-x: auto;
+      max-height: 60vh;
+      overflow-y: auto;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+    }
+    .hidden { display: none !important; }
+    .error { color: var(--danger); margin: 1rem 0; }
+    .timestamp { font-variant-numeric: tabular-nums; }
+    .mono { font-family: inherit; word-break: break-all; }
+  </style>
+</head>
+<body>
+  <h1>SSH Honeypot — Database Viewer</h1>
+
+  <div id="upload" class="upload-zone">
+    <input type="file" id="file" accept=".db,.sqlite,.sqlite3">
+    <p>Drop <code>honeypot.db</code> here or click to select</p>
+  </div>
+
+  <div id="content" class="hidden">
+    <div class="tabs">
+      <button data-tab="logins" class="active">Logins</button>
+      <button data-tab="commands">Commands</button>
+    </div>
+
+    <div class="stats">
+      <span>Logins: <strong id="login-count">0</strong></span>
+      <span>Commands: <strong id="cmd-count">0</strong></span>
+    </div>
+
+    <div id="logins-panel">
+      <div class="filters">
+        <label>Username <input type="text" id="filter-login-user" placeholder="Filter..."></label>
+        <label>IP <input type="text" id="filter-login-ip" placeholder="Filter..."></label>
+        <label>Password <input type="text" id="filter-login-pass" placeholder="Filter..."></label>
+        <button id="reset-login-filters">Reset</button>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>ID</th><th>Username</th><th>Password</th><th>Remote IP</th><th>Client Version</th><th>Timestamp</th></tr></thead>
+          <tbody id="logins-tbody"></tbody>
+        </table>
+      </div>
+    </div>
+
+    <div id="commands-panel" class="hidden">
+      <div class="filters">
+        <label>Username <input type="text" id="filter-cmd-user" placeholder="Filter..."></label>
+        <label>IP <input type="text" id="filter-cmd-ip" placeholder="Filter..."></label>
+        <label>Command <input type="text" id="filter-cmd-text" placeholder="Filter..."></label>
+        <button id="reset-cmd-filters">Reset</button>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>ID</th><th>Username</th><th>Remote IP</th><th>Command</th><th>Timestamp</th></tr></thead>
+          <tbody id="commands-tbody"></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <div id="error" class="error hidden"></div>
+
+  <script>
+    let SQL = null;
+    let db = null;
+
+    const config = {
+      locateFile: file => `https://sql.js.org/dist/${file}`
+    };
+
+    initSqlJs(config).then(module => {
+      SQL = module;
+      document.getElementById('upload').classList.remove('hidden');
+    }).catch(err => {
+      document.getElementById('error').textContent = 'Failed to load sql.js: ' + err.message;
+      document.getElementById('error').classList.remove('hidden');
+    });
+
+    const upload = document.getElementById('upload');
+    const fileInput = document.getElementById('file');
+
+    upload.addEventListener('click', () => fileInput.click());
+    upload.addEventListener('dragover', e => { e.preventDefault(); upload.classList.add('dragover'); });
+    upload.addEventListener('dragleave', () => upload.classList.remove('dragover'));
+    upload.addEventListener('drop', e => {
+      e.preventDefault();
+      upload.classList.remove('dragover');
+      if (e.dataTransfer.files.length) loadDb(e.dataTransfer.files[0]);
+    });
+    fileInput.addEventListener('change', () => {
+      if (fileInput.files.length) loadDb(fileInput.files[0]);
+    });
+
+    function loadDb(file) {
+      const reader = new FileReader();
+      reader.onload = () => {
+        try {
+          const buf = new Uint8Array(reader.result);
+          db = new SQL.Database(buf);
+          document.getElementById('upload').classList.add('hidden');
+          document.getElementById('content').classList.remove('hidden');
+          document.getElementById('error').classList.add('hidden');
+          refresh();
+        } catch (e) {
+          document.getElementById('error').textContent = 'Invalid database: ' + e.message;
+          document.getElementById('error').classList.remove('hidden');
+        }
+      };
+      reader.readAsArrayBuffer(file);
+    }
+
+    function runQuery(sql, params = []) {
+      if (!db) return [];
+      const stmt = db.prepare(sql);
+      stmt.bind(params);
+      const rows = [];
+      while (stmt.step()) rows.push(stmt.get());
+      stmt.free();
+      return rows;
+    }
+
+    function formatTs(ts) {
+      if (!ts) return ts;
+      const n = parseInt(ts, 10);
+      if (isNaN(n)) return ts;
+      const d = new Date(n * 1000);
+      return d.toISOString().replace('T', ' ').slice(0, 19);
+    }
+
+    function refresh() {
+      if (!db) return;
+
+      const loginCount = runQuery('SELECT COUNT(*) FROM Login')[0]?.[0] ?? 0;
+      const cmdCount = runQuery('SELECT COUNT(*) FROM Command')[0]?.[0] ?? 0;
+      document.getElementById('login-count').textContent = loginCount;
+      document.getElementById('cmd-count').textContent = cmdCount;
+
+      renderLogins();
+      renderCommands();
+    }
+
+    function getLoginFilters() {
+      return {
+        user: document.getElementById('filter-login-user').value.trim(),
+        ip: document.getElementById('filter-login-ip').value.trim(),
+        pass: document.getElementById('filter-login-pass').value.trim()
+      };
+    }
+
+    function getCmdFilters() {
+      return {
+        user: document.getElementById('filter-cmd-user').value.trim(),
+        ip: document.getElementById('filter-cmd-ip').value.trim(),
+        text: document.getElementById('filter-cmd-text').value.trim()
+      };
+    }
+
+    function renderLogins() {
+      const f = getLoginFilters();
+      let sql = 'SELECT LoginID, Username, Password, RemoteIP, RemoteVersion, Timestamp FROM Login WHERE 1=1';
+      const params = [];
+      if (f.user) { params.push('%' + f.user + '%'); sql += ' AND Username LIKE ?'; }
+      if (f.ip) { params.push('%' + f.ip + '%'); sql += ' AND RemoteIP LIKE ?'; }
+      if (f.pass) { params.push('%' + f.pass + '%'); sql += ' AND Password LIKE ?'; }
+      sql += ' ORDER BY Timestamp DESC';
+
+      const rows = runQuery(sql, params);
+      const tbody = document.getElementById('logins-tbody');
+      tbody.innerHTML = rows.map(r => `
+        <tr>
+          <td>${r[0]}</td>
+          <td class="mono">${escapeHtml(r[1] ?? '')}</td>
+          <td class="mono">${escapeHtml(r[2] ?? '')}</td>
+          <td class="mono">${escapeHtml(r[3] ?? '')}</td>
+          <td class="mono">${escapeHtml(r[4] ?? '')}</td>
+          <td class="timestamp">${formatTs(r[5])}</td>
+        </tr>
+      `).join('');
+    }
+
+    function renderCommands() {
+      const f = getCmdFilters();
+      let sql = 'SELECT CommandID, Username, RemoteIP, Command, Timestamp FROM Command WHERE 1=1';
+      const params = [];
+      if (f.user) { params.push('%' + f.user + '%'); sql += ' AND Username LIKE ?'; }
+      if (f.ip) { params.push('%' + f.ip + '%'); sql += ' AND RemoteIP LIKE ?'; }
+      if (f.text) { params.push('%' + f.text + '%'); sql += ' AND Command LIKE ?'; }
+      sql += ' ORDER BY Timestamp DESC';
+
+      const rows = runQuery(sql, params);
+      const tbody = document.getElementById('commands-tbody');
+      tbody.innerHTML = rows.map(r => `
+        <tr>
+          <td>${r[0]}</td>
+          <td class="mono">${escapeHtml(r[1] ?? '')}</td>
+          <td class="mono">${escapeHtml(r[2] ?? '')}</td>
+          <td class="mono">${escapeHtml(r[3] ?? '')}</td>
+          <td class="timestamp">${formatTs(r[4])}</td>
+        </tr>
+      `).join('');
+    }
+
+    function escapeHtml(s) {
+      const div = document.createElement('div');
+      div.textContent = s;
+      return div.innerHTML;
+    }
+
+    document.querySelectorAll('.tabs button').forEach(btn => {
+      btn.addEventListener('click', () => {
+        document.querySelectorAll('.tabs button').forEach(b => b.classList.remove('active'));
+        btn.classList.add('active');
+        document.getElementById('logins-panel').classList.toggle('hidden', btn.dataset.tab !== 'logins');
+        document.getElementById('commands-panel').classList.toggle('hidden', btn.dataset.tab !== 'commands');
+      });
+    });
+
+    ['filter-login-user','filter-login-ip','filter-login-pass'].forEach(id => {
+      document.getElementById(id).addEventListener('input', debounce(renderLogins, 250));
+    });
+    ['filter-cmd-user','filter-cmd-ip','filter-cmd-text'].forEach(id => {
+      document.getElementById(id).addEventListener('input', debounce(renderCommands, 250));
+    });
+
+    document.getElementById('reset-login-filters').addEventListener('click', () => {
+      document.getElementById('filter-login-user').value = '';
+      document.getElementById('filter-login-ip').value = '';
+      document.getElementById('filter-login-pass').value = '';
+      renderLogins();
+    });
+    document.getElementById('reset-cmd-filters').addEventListener('click', () => {
+      document.getElementById('filter-cmd-user').value = '';
+      document.getElementById('filter-cmd-ip').value = '';
+      document.getElementById('filter-cmd-text').value = '';
+      renderCommands();
+    });
+
+    function debounce(fn, ms) {
+      let t;
+      return () => { clearTimeout(t); t = setTimeout(fn, ms); };
+    }
+  </script>
+</body>
+</html>
