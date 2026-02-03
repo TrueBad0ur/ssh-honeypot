@@ -116,6 +116,7 @@
     .error { color: var(--danger); margin: 1rem 0; }
     .timestamp { font-variant-numeric: tabular-nums; }
     .mono { font-family: inherit; word-break: break-all; }
+    .cmd-cell { white-space: pre-wrap; word-break: break-word; max-width: 40rem; }
   </style>
 </head>
 <body>
@@ -304,7 +305,7 @@
           <td>${r[0]}</td>
           <td class="mono">${escapeHtml(r[1] ?? '')}</td>
           <td class="mono">${escapeHtml(r[2] ?? '')}</td>
-          <td class="mono">${escapeHtml(r[3] ?? '')}</td>
+          <td class="mono cmd-cell">${escapeHtml(r[3] ?? '')}</td>
           <td class="timestamp">${formatTs(r[4])}</td>
         </tr>
       `).join('');
