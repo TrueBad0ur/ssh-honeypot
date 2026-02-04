@@ -117,20 +117,54 @@
     .timestamp { font-variant-numeric: tabular-nums; }
     .mono { font-family: inherit; word-break: break-all; }
     .cmd-cell { white-space: pre-wrap; word-break: break-word; max-width: 40rem; }
+    .console-tab { display: flex; flex-direction: column; gap: 1rem; }
+    .console-session-picker { display: flex; align-items: center; gap: 0.75rem; flex-wrap: wrap; }
+    .console-session-picker label { color: var(--muted); font-size: 0.85rem; }
+    .console-session-picker select {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      color: var(--text);
+      padding: 0.4rem 0.6rem;
+      border-radius: 4px;
+      font-family: inherit;
+      min-width: 16rem;
+    }
+    .console-wrap {
+      background: #0a0e14;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 1rem;
+      overflow: auto;
+      max-height: 65vh;
+      font-size: 0.8rem;
+      line-height: 1.4;
+    }
+    .console-block { margin-bottom: 0.5rem; }
+    .console-line { color: var(--text); white-space: pre-wrap; word-break: break-word; }
+    .console-prompt { color: var(--success); }
+    .console-out { color: var(--muted); white-space: pre-wrap; word-break: break-word; margin-top: 0.15rem; }
+    .console-out:empty { display: none; }
+    .console-session-meta { color: var(--muted); font-size: 0.8rem; margin-bottom: 0.5rem; }
+    .upload-zone.loading { pointer-events: none; opacity: 0.9; }
+    .upload-zone.loading .upload-ready { display: none; }
+    .upload-zone.loading .upload-loading { display: block; }
+    .upload-zone .upload-loading { display: none; }
   </style>
 </head>
 <body>
   <h1>SSH Honeypot — Database Viewer</h1>
 
-  <div id="upload" class="upload-zone">
+  <div id="upload" class="upload-zone loading">
     <input type="file" id="file" accept=".db,.sqlite,.sqlite3">
-    <p>Drop <code>honeypot.db</code> here or click to select</p>
+    <p class="upload-loading">Loading sql.js…</p>
+    <p class="upload-ready">Drop <code>honeypot.db</code> here or click to select</p>
   </div>
 
   <div id="content" class="hidden">
     <div class="tabs">
       <button data-tab="logins" class="active">Logins</button>
       <button data-tab="commands">Commands</button>
+      <button data-tab="console">Console</button>
     </div>
 
     <div class="stats">
@@ -167,6 +201,17 @@
         </table>
       </div>
     </div>
+
+    <div id="console-panel" class="hidden console-tab">
+      <div class="console-session-picker">
+        <label>Session (IP + user):</label>
+        <select id="console-session">
+          <option value="">— select —</option>
+        </select>
+      </div>
+      <div class="console-session-meta" id="console-meta"></div>
+      <div class="console-wrap" id="console-output"></div>
+    </div>
   </div>
 
   <div id="error" class="error hidden"></div>
@@ -181,10 +226,12 @@
 
     initSqlJs(config).then(module => {
       SQL = module;
-      document.getElementById('upload').classList.remove('hidden');
+      const el = document.getElementById('upload');
+      el.classList.remove('loading');
     }).catch(err => {
       document.getElementById('error').textContent = 'Failed to load sql.js: ' + err.message;
       document.getElementById('error').classList.remove('hidden');
+      document.getElementById('upload').classList.remove('loading');
     });
 
     const upload = document.getElementById('upload');
@@ -203,6 +250,11 @@
     });
 
     function loadDb(file) {
+      if (!SQL) {
+        document.getElementById('error').textContent = 'SQL.js is still loading. Please wait a moment and try again.';
+        document.getElementById('error').classList.remove('hidden');
+        return;
+      }
       const reader = new FileReader();
       reader.onload = () => {
         try {
@@ -238,6 +290,135 @@
       return d.toISOString().replace('T', ' ').slice(0, 19);
     }
 
+    function hasResponseColumn() {
+      if (!db) return false;
+      const info = runQuery("PRAGMA table_info(Command)");
+      return info.some(r => (r[1] || '').toLowerCase() === 'response');
+    }
+
+    const HOSTNAME = 'kali';
+    function splitBySemicolonOutsideQuotes(s) {
+      const result = [];
+      let current = '';
+      let inSingle = false, inDouble = false;
+      for (let i = 0; i < s.length; i++) {
+        const c = s[i];
+        if (c === "'" && !inDouble) { inSingle = !inSingle; current += c; }
+        else if (c === '"' && !inSingle) { inDouble = !inDouble; current += c; }
+        else if (c === '\\' && i + 1 < s.length) { current += s[++i]; }
+        else if (c === ';' && !inSingle && !inDouble) { result.push(current); current = ''; }
+        else current += c;
+      }
+      result.push(current);
+      return result;
+    }
+    function emulateCommandInJs(line, username) {
+      if (!line || !line.trim()) return '';
+      const out = [];
+      const lines = line.split('\n');
+      for (const ln of lines) {
+        const segments = splitBySemicolonOutsideQuotes(ln);
+        for (let seg of segments) {
+          seg = seg.trim();
+          if (!seg) continue;
+          const parts = seg.split(/\s+/).filter(Boolean);
+          if (!parts.length) continue;
+          let cmd = parts[0];
+          const rest = seg.slice(seg.indexOf(parts[0]) + parts[0].length).trim();
+          if (cmd.includes('=') || ['for','do','done','if','then','fi','break','export'].includes(cmd)) continue;
+          if (cmd === '/bin/./uname' || cmd.endsWith('uname')) cmd = 'uname';
+          const u = username || 'user';
+          switch (cmd) {
+            case 'exit': case 'cd': case 'chmod': case 'rm': case 'history': case 'sleep': case 'mv': continue;
+            case 'ls':
+              if (rest.includes('-la') && (seg.includes('/var/run') || seg.includes('var/run')))
+                out.push('total 12\ndrwxr-xr-x 12 root root 300 Jan 15 12:34 .\ndrwxr-xr-x 5 root root 4096 Jan 14 10:00 ..\n-rw-r--r-- 1 root root 0 Jan 15 12:00 gcc.pid');
+              else if (rest.includes('-la') && seg.includes('/ '))
+                out.push('total 64\ndrwxr-xr-x 5 root root 4096 Jan 15 12:00 .\nlrwxrwxrwx 1 root root 7 Jan 14 10:00 bin -> usr/bin\ndrwxr-xr-x 2 root root 4096 Jan 14 10:00 home\ndrwxr-xr-x 2 root root 4096 Jan 14 10:00 root');
+              else out.push('id_rsa  id_rsa.pub  configs');
+              break;
+            case 'whoami': out.push(u); break;
+            case 'id': out.push(`uid=1000(${u}) gid=1000(${u}) groups=1000(${u}),27(sudo),999(docker)`); break;
+            case 'pwd': out.push(`/home/${u}`); break;
+            case 'echo':
+              if (seg.includes('UNAME:')) out.push(`UNAME:Linux #1 SMP Debian 5.10.162-1 (2023-01-21) ${HOSTNAME} 5.10.0-21-amd64 x86_64`);
+              else if (seg.includes('ARCH:')) out.push('ARCH:x86_64');
+              else if (seg.includes('UPTIME:')) out.push('UPTIME:123456');
+              else if (seg.includes('CPUS:')) out.push('CPUS:4');
+              else if (seg.includes('CPU_MODEL:')) out.push('CPU_MODEL: Intel(R) Core(TM) i5-8400 CPU @ 2.80GHz');
+              else if (seg.includes('GPU:')) out.push('GPU: 00:02.0 VGA compatible controller: Intel Corporation HD Graphics 630');
+              else if (seg.includes('CAT_HELP:')) out.push('CAT_HELP: Usage: cat [OPTION]... [FILE]... -n number output lines');
+              else if (seg.includes('LS_HELP:')) out.push('LS_HELP: Usage: ls [OPTION]... [FILE]... -l use a long listing format');
+              else if (seg.includes('LAST:')) out.push('LAST: root pts/0 1.2.3.4 Mon Jan 15 12:34 still logged in');
+              break;
+            case 'cat':
+              if (seg.includes('/dev/null') && seg.includes('>')) break;
+              if (seg.includes('/etc/hostname')) out.push(HOSTNAME);
+              else if (seg.includes('/etc/passwd')) out.push('root:x:0:0:root:/root:/bin/bash');
+              else if (seg.includes('/etc/shadow')) out.push('root:*:19000:0:99999:7:::');
+              else if (seg.includes('/proc/cpuinfo')) out.push('model name\t: Intel(R) Core(TM) i5-8400 CPU @ 2.80GHz');
+              else if (seg.includes('/proc/version')) out.push('Linux version 5.10.0-21-amd64 (debian-kernel@lists.debian.org) (gcc (Debian 10.2.1-6) 10.2.1 20210110, GNU ld (GNU Binutils for Debian) 2.35.2) #1 SMP Debian 5.10.162-1 (2023-01-21)');
+              else if (seg.includes('/proc/uptime')) out.push('123456.78 123455.12');
+              else out.push(`bash: ${cmd}: command not found`);
+              break;
+            case 'nproc': out.push('4'); break;
+            case 'grep':
+              if (seg.includes('/proc/cpuinfo')) out.push(seg.includes('-c') && seg.includes('processor') ? '4' : 'model name\t: Intel(R) Core(TM) i5-8400 CPU @ 2.80GHz');
+              break;
+            case 'uname':
+              const onlyM = rest.includes('-m') && !rest.includes('-s') && !rest.includes('-v') && !rest.includes('-n') && !rest.includes('-r');
+              out.push(onlyM ? 'x86_64' : `Linux #1 SMP Debian 5.10.162-1 (2023-01-21) ${HOSTNAME} 5.10.0-21-amd64 x86_64`);
+              break;
+            case 'uptime': out.push(' 12:34:56 up 2 days,  3:21,  1 user,  load average: 0.12, 0.08, 0.06'); break;
+            case 'hostname': out.push(HOSTNAME); break;
+            case 'lscpu': out.push('Model name:            Intel(R) Core(TM) i5-8400 CPU @ 2.80GHz'); break;
+            case 'lspci':
+              if (seg.includes('grep VGA -c') || (seg.includes('VGA') && seg.includes('-c'))) out.push('1');
+              else if (seg.includes('VGA') || seg.includes('3D')) out.push('00:02.0 VGA compatible controller: Intel Corporation HD Graphics 630');
+              else out.push('00:00.0 Host bridge: Intel Corporation 8th Gen Core Processor Host Bridge\n00:02.0 VGA compatible controller: Intel Corporation HD Graphics 630');
+              break;
+            case 'nvidia-smi':
+              if (seg.includes('grep . -c') || (seg.includes('Product Name') && seg.includes('-c'))) out.push('1');
+              else out.push('==============NVSMI LOG==============\nDriver Version: 535.129.03   CUDA Version: 12.2\n\nAttached GPUs: 1\n\nGPU 00000000:01:00.0\n    Product Name: NVIDIA GeForce GTX 1080\n    Product Brand: GeForce\n    ...');
+              break;
+            case 'curl': case 'wget':
+              if (line.includes('| sh') || line.includes(' sh -s ')) out.push('#!/bin/sh\nexit 0');
+              else if (line.includes('http') || line.includes('://')) out.push(line.includes('curl') ? '  % Total    % Received ... 100   123  100   123 ...' : '--2024-01-15 12:34:56--  http://example.com/script.sh\n... saved [1234/1234]');
+              else out.push(`bash: ${cmd}: command not found`);
+              break;
+            case 'good':
+              if (line.includes('http') || line.includes('://')) out.push('--2024-01-15 12:34:56--  http://example.com/script.sh\n... saved [1234/1234]');
+              else out.push(`bash: ${cmd}: command not found`);
+              break;
+            case 'ip':
+              out.push(line.includes(' route') ? '10.0.0.0/24 dev eth0 proto kernel scope link src 10.0.0.5' : '1: lo: <LOOPBACK,UP> mtu 65536\n2: eth0: <BROADCAST,UP> mtu 1500');
+              break;
+            case 'ssh':
+              if (rest.includes('-V')) out.push('OpenSSH_8.2p1 Debian-4');
+              else out.push(`bash: ${cmd}: command not found`);
+              break;
+            case 'env': out.push(`USER=${u}\nHOME=/home/${u}\nPATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\nPWD=/home/${u}\nLANG=C.UTF-8`); break;
+            case 'which':
+              if (seg.includes('apt')) out.push('/usr/bin/apt');
+              else { const arg = rest.split(/\s+/)[0]; if (arg && (seg.includes('nproc') || seg.includes('curl') || seg.includes('wget') || seg.includes('grep') || seg.includes('uname'))) out.push('/usr/bin/' + arg); }
+              break;
+            case 'ping': if (seg.includes('-c')) out.push('1 packets transmitted, 1 received, 0% packet loss'); break;
+            case 'ps': out.push('  PID TTY      TIME CMD\n  1 ?     00:00:01 systemd\n  2 ?     00:00:00 kthreadd'); break;
+            case 'mount': out.push('sysfs on /sys type sysfs (rw,nosuid,nodev,noexec)\nproc on /proc type proc (rw,nosuid,nodev,noexec)'); break;
+            case 'netstat': if (seg.includes('-tulpn') || seg.includes('-tln')) out.push('tcp  0  0 0.0.0.0:22  0.0.0.0:*  LISTEN  1234/sshd'); break;
+            case 'ss': if (seg.includes('-tuln') || seg.includes('-tln')) out.push('State  Recv-Q Send-Q Local Address:Port  Peer Address:Port\ntcp   LISTEN 0  128  0.0.0.0:22  0.0.0.0:*'); break;
+            case 'systemctl': if (seg.includes('list-units') || seg.includes('running')) out.push('sshd.service  loaded active running OpenSSH daemon'); break;
+            case 'time': out.push('0.00user 0.00system 0:00.00elapsed 0%CPU'); break;
+            case 'dmidecode': if (seg.includes('processor-version') || seg.includes('-s')) out.push('Intel(R) Core(TM) i5-8400 CPU @ 2.80GHz'); break;
+            default:
+              if (cmd.startsWith('./') || (cmd === 'sh' && parts.length > 1)) break;
+              if (cmd !== 'scp') out.push(`bash: ${cmd}: command not found`);
+          }
+        }
+      }
+      return out.join('\n') ? out.join('\n') + '\n' : '';
+    }
+
     function refresh() {
       if (!db) return;
 
@@ -248,6 +429,46 @@
 
       renderLogins();
       renderCommands();
+      refreshConsoleSessions();
+    }
+
+    function refreshConsoleSessions() {
+      const sel = document.getElementById('console-session');
+      const meta = document.getElementById('console-meta');
+      const out = document.getElementById('console-output');
+      if (!db || !sel) return;
+      const rows = runQuery('SELECT DISTINCT RemoteIP, Username FROM Command ORDER BY RemoteIP, Username');
+      sel.innerHTML = '<option value="">— select —</option>' + rows.map((r, i) => {
+        const key = (r[0] || '') + '|' + (r[1] || '');
+        return `<option value="${escapeHtml(key)}">${escapeHtml(r[0] || '')} (${escapeHtml(r[1] || '')})</option>`;
+      }).join('');
+      sel.value = '';
+      meta.textContent = '';
+      out.innerHTML = '';
+    }
+
+    function onConsoleSessionChange() {
+      const sel = document.getElementById('console-session');
+      const meta = document.getElementById('console-meta');
+      const out = document.getElementById('console-output');
+      const val = sel.value;
+      if (!val || !db) { meta.textContent = ''; out.innerHTML = ''; return; }
+      const [ip, user] = val.split('|');
+      const hasResp = hasResponseColumn();
+      const sql = hasResp
+        ? 'SELECT CommandID, Username, RemoteIP, Command, Response, Timestamp FROM Command WHERE RemoteIP = ? AND Username = ? ORDER BY CommandID ASC'
+        : 'SELECT CommandID, Username, RemoteIP, Command, Timestamp FROM Command WHERE RemoteIP = ? AND Username = ? ORDER BY CommandID ASC';
+      const rows = runQuery(sql, [ip, user]);
+      const firstTs = rows[0] ? rows[0][hasResp ? 5 : 4] : null;
+      const lastTs = rows.length ? rows[rows.length - 1][hasResp ? 5 : 4] : null;
+      meta.textContent = rows.length + ' commands' + (firstTs && lastTs ? ' • ' + formatTs(firstTs) + ' — ' + formatTs(lastTs) : '');
+      const hostname = 'kali';
+      out.innerHTML = rows.map(r => {
+        const cmd = (r[3] ?? '').trim();
+        const respFromDb = hasResp ? (r[4] ?? '') : '';
+        const resp = (respFromDb && respFromDb.trim()) ? respFromDb : emulateCommandInJs(cmd, user || 'user');
+        return '<div class="console-block"><div class="console-line"><span class="console-prompt">' + escapeHtml(user || 'user') + '@' + hostname + ':~$ </span>' + escapeHtml(cmd) + '</div>' + (resp ? '<div class="console-out">' + escapeHtml(resp) + '</div>' : '') + '</div>';
+      }).join('');
     }
 
     function getLoginFilters() {
@@ -323,6 +544,8 @@
         btn.classList.add('active');
         document.getElementById('logins-panel').classList.toggle('hidden', btn.dataset.tab !== 'logins');
         document.getElementById('commands-panel').classList.toggle('hidden', btn.dataset.tab !== 'commands');
+        document.getElementById('console-panel').classList.toggle('hidden', btn.dataset.tab !== 'console');
+        if (btn.dataset.tab === 'console') refreshConsoleSessions();
       });
     });
 
@@ -345,6 +568,8 @@
       document.getElementById('filter-cmd-text').value = '';
       renderCommands();
     });
+
+    document.getElementById('console-session').addEventListener('change', onConsoleSessionChange);
 
     function debounce(fn, ms) {
       let t;

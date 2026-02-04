@@ -3,10 +3,12 @@ package main
 import (
 	"database/sql"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -19,12 +21,15 @@ import (
 
 var (
 	database         *sql.DB
+	dbPath           string = "db/honeypot.db"
 	doCommandLogging bool   = false
 	hostname         string = "kali"
 	message          string = "Don't blindly SSH into every VM you see."
 	loginChan        chan (loginData)
 	cmdChan          chan (command)
 )
+
+const backupThresholdBytes = 15 * 1024 * 1024 // 15 MB
 
 const buffSize = 5
 
@@ -40,6 +45,7 @@ type command struct {
 	username  string
 	remoteIP  string
 	command   string
+	response  string
 	timestamp string
 }
 
@@ -50,7 +56,8 @@ func main() {
 		keyPath     string = "id_rsa"
 		fingerprint string = "OpenSSH_8.2p1 Debian-4"
 	)
-	databasePointer, err := initDatabase("db/honeypot.db")
+	dbPath = "db/honeypot.db"
+	databasePointer, err := initDatabase(dbPath)
 	if err != nil {
 		log.Println(err.Error())
 		log.Fatal("Database connection failed")
@@ -102,6 +109,10 @@ func main() {
 		go threadsafeCommandLogger()
 		log.Println("Started command logger")
 	}
+	go backupLoop()
+	log.Println("Started DB backup (every 15 MB)")
+	go checkpointLoop()
+	log.Println("Started WAL checkpoint (every 5 min)")
 	log.Println("Started Honeypot SSH server on", server.Addr)
 	log.Fatal(server.ListenAndServe())
 }
@@ -117,9 +128,14 @@ func initDatabase(path string) (*sql.DB, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
 		return nil, fmt.Errorf("create db dir: %w", err)
 	}
-	db, err := sql.Open("sqlite3", path)
+	db, err := sql.Open("sqlite3", path+"?_busy_timeout=10000&_journal_mode=WAL")
 	if err != nil {
 		return nil, err
+	}
+	// WAL allows concurrent reads; busy_timeout makes writer wait instead of "database is locked"
+	if _, err := db.Exec("PRAGMA busy_timeout=10000"); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("pragma busy_timeout: %w", err)
 	}
 	schema := `
 	CREATE TABLE IF NOT EXISTS Login (
@@ -142,6 +158,7 @@ func initDatabase(path string) (*sql.DB, error) {
 		db.Close()
 		return nil, fmt.Errorf("init schema: %w", err)
 	}
+	_, _ = db.Exec("ALTER TABLE Command ADD COLUMN Response TEXT") // ignore if exists
 	return db, nil
 }
 
@@ -161,17 +178,111 @@ func threadsafeCommandLogger() {
 
 func logCommand(cmd command) {
 	statement, err := database.Prepare(
-		"INSERT INTO Command(Username, RemoteIP, Command, Timestamp) values(?,?,?,?)")
+		"INSERT INTO Command(Username, RemoteIP, Command, Response, Timestamp) values(?,?,?,?,?)")
 	if err != nil {
 		log.Println(err.Error())
+		return
 	}
 	_, err = statement.Exec(
 		cmd.username,
 		cmd.remoteIP,
 		cmd.command,
+		cmd.response,
 		cmd.timestamp)
 	if err != nil {
 		log.Println(err.Error())
+	}
+}
+
+// dbFileSize returns total size of main DB file + WAL file if present.
+func dbFileSize(path string) int64 {
+	info, err := os.Stat(path)
+	if err != nil {
+		return 0
+	}
+	size := info.Size()
+	walPath := path + "-wal"
+	if infoWAL, err := os.Stat(walPath); err == nil {
+		size += infoWAL.Size()
+	}
+	return size
+}
+
+// backupDB copies the database to honeypot-db-<timestamp>.db in the same directory.
+func backupDB() error {
+	dir := filepath.Dir(dbPath)
+	name := "honeypot-db-" + strconv.FormatInt(time.Now().Unix(), 10) + ".db"
+	dest := filepath.Join(dir, name)
+	absDest, err := filepath.Abs(dest)
+	if err != nil {
+		return err
+	}
+	// VACUUM INTO produces a consistent copy (SQLite 3.27+)
+	escaped := strings.ReplaceAll(absDest, "'", "''")
+	if _, err := database.Exec("VACUUM INTO '" + escaped + "'"); err != nil {
+		// Fallback: copy main file (and -wal) — copy may be inconsistent if writes happen
+		return copyFile(dbPath, dest)
+	}
+	log.Println("Backup written:", dest)
+	return nil
+}
+
+func copyFile(src, dst string) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	if err := os.MkdirAll(filepath.Dir(dst), 0755); err != nil {
+		return err
+	}
+	out, err := os.Create(dst)
+	if err != nil {
+		return err
+	}
+	defer out.Close()
+	if _, err := io.Copy(out, in); err != nil {
+		return err
+	}
+	walSrc := src + "-wal"
+	if inWAL, err := os.Open(walSrc); err == nil {
+		outWAL, err := os.Create(dst + "-wal")
+		if err == nil {
+			io.Copy(outWAL, inWAL)
+			outWAL.Close()
+		}
+		inWAL.Close()
+	}
+	log.Println("Backup written (copy):", dst)
+	return nil
+}
+
+func backupLoop() {
+	tick := time.NewTicker(60 * time.Second)
+	defer tick.Stop()
+	lastBackupSize := dbFileSize(dbPath)
+	for range tick.C {
+		current := dbFileSize(dbPath)
+		if current < lastBackupSize+backupThresholdBytes {
+			continue
+		}
+		if err := backupDB(); err != nil {
+			log.Println("Backup failed:", err)
+			continue
+		}
+		lastBackupSize = current
+	}
+}
+
+// checkpointLoop runs PRAGMA wal_checkpoint(TRUNCATE) periodically so WAL content
+// is moved into honeypot.db and honeypot.db-wal is truncated.
+func checkpointLoop() {
+	tick := time.NewTicker(5 * time.Minute)
+	defer tick.Stop()
+	for range tick.C {
+		if _, err := database.Exec("PRAGMA wal_checkpoint(TRUNCATE)"); err != nil {
+			log.Println("WAL checkpoint:", err)
+		}
 	}
 }
 
@@ -203,6 +314,7 @@ func fakeTerminal(s ssh.Session) {
 			username:  s.User(),
 			remoteIP:  s.RemoteAddr().String(),
 			command:   commandLine,
+			response:  "",
 			timestamp: fmt.Sprint(time.Now().Unix())}
 	}
 	term := term.NewTerminal(s, fmt.Sprintf("%s@%s:~$ ", s.User(), hostname))
@@ -225,6 +337,7 @@ func fakeTerminal(s ssh.Session) {
 					username:  s.User(),
 					remoteIP:  s.RemoteAddr().String(),
 					command:   commandLine,
+					response:  "",
 					timestamp: fmt.Sprint(time.Now().Unix())}
 			}
 			break
@@ -240,10 +353,51 @@ func fakeTerminal(s ssh.Session) {
 				username:  s.User(),
 				remoteIP:  s.RemoteAddr().String(),
 				command:   commandLine,
+				response:  output,
 				timestamp: fmt.Sprint(time.Now().Unix())}
 			}
-	}
+		}
 	s.Close()
+}
+
+// splitBySemicolonOutsideQuotes splits by ";" only when not inside single or double quotes (e.g. sed 's/^ *//;s/ *$//' stays one segment).
+func splitBySemicolonOutsideQuotes(s string) []string {
+	var result []string
+	var current strings.Builder
+	inSingle, inDouble := false, false
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch c {
+		case '\'':
+			if !inDouble {
+				inSingle = !inSingle
+			}
+			current.WriteByte(c)
+		case '"':
+			if !inSingle {
+				inDouble = !inDouble
+			}
+			current.WriteByte(c)
+		case '\\':
+			if i+1 < len(s) {
+				current.WriteByte(s[i+1])
+				i++
+			} else {
+				current.WriteByte(c)
+			}
+		case ';':
+			if !inSingle && !inDouble {
+				result = append(result, current.String())
+				current.Reset()
+			} else {
+				current.WriteByte(c)
+			}
+		default:
+			current.WriteByte(c)
+		}
+	}
+	result = append(result, current.String())
+	return result
 }
 
 // emulateCommand returns fake OS output for bot commands. Splits by newlines and ";", emulates each segment.
@@ -251,7 +405,7 @@ func emulateCommand(line, username string) string {
 	var out strings.Builder
 	lines := strings.Split(line, "\n")
 	for _, ln := range lines {
-		segments := strings.Split(ln, ";")
+		segments := splitBySemicolonOutsideQuotes(ln)
 		for _, seg := range segments {
 			seg = strings.TrimSpace(seg)
 			if seg == "" {
@@ -383,9 +537,16 @@ func emulateCommand(line, username string) string {
 			}
 		case "nvidia-smi":
 			if strings.Contains(seg, "grep . -c") || (strings.Contains(seg, "Product Name") && strings.Contains(seg, "-c")) {
-				out.WriteString("0\n")
+				out.WriteString("1\n")
 			} else {
-				out.WriteString("NVIDIA-SMI has failed because it couldn't communicate with the NVIDIA driver.\n")
+				// Emulate presence of NVIDIA GPU so bot continues dialogue
+				out.WriteString("==============NVSMI LOG==============\n")
+				out.WriteString("Driver Version: 535.129.03   CUDA Version: 12.2\n\n")
+				out.WriteString("Attached GPUs: 1\n\n")
+				out.WriteString("GPU 00000000:01:00.0\n")
+				out.WriteString("    Product Name: NVIDIA GeForce GTX 1080\n")
+				out.WriteString("    Product Brand: GeForce\n")
+				out.WriteString("    ...\n")
 			}
 		case "curl":
 			if strings.Contains(line, "ipinfo.io/org") {
@@ -467,6 +628,10 @@ func emulateCommand(line, username string) string {
 			}
 		case "time":
 			out.WriteString("0.00user 0.00system 0:00.00elapsed 0%CPU\n")
+		case "dmidecode":
+			if strings.Contains(seg, "processor-version") || strings.Contains(seg, "-s") {
+				out.WriteString("Intel(R) Core(TM) i5-8400 CPU @ 2.80GHz\n")
+			}
 		default:
 			if strings.Contains(line, "update") {
 				out.WriteString("Get:1 file:/etc/apt/mirrors/debian.list Mirrorlist [40 B]\nGet:5 file:/etc/apt/mirrors/debian-security.list Mirrorlist [25 B]\nReading package lists... Done\nBuilding dependency tree... Done\nReading state information... Done\nAll packages are up to date.\n")

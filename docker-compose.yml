@@ -1,7 +1,7 @@
 version: "3.9"
 services:
   ssh-honeypot:
-    image: truebad0ur/ssh-honeypot:v0.0.8
+    image: truebad0ur/ssh-honeypot:v0.1.3
     container_name: ssh-honeypot
     build: ./app
     ports:
